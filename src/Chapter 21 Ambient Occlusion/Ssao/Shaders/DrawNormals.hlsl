@@ -45,9 +45,9 @@ VertexOut VS(VertexIn vin)
     vout.NormalW = mul(vin.NormalL, (float3x3)gWorld);
 	vout.TangentW = mul(vin.TangentU, (float3x3)gWorld);
 
-    // Transform to homogeneous clip space.
+    // Transform to homogeneous clip space using jittered ViewProj for TAA
     float4 posW = mul(float4(vin.PosL, 1.0f), gWorld);
-    vout.PosH = mul(posW, gViewProj);
+    vout.PosH = mul(posW, gJitteredViewProj);
 	
 	// Output vertex attributes for interpolation across triangle.
 	float4 texC = mul(float4(vin.TexC, 0.0f, 1.0f), gTexTransform);

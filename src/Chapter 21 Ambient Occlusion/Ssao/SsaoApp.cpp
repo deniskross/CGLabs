@@ -737,6 +737,14 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
 	XMMATRIX view = mCamera.GetView();
 	XMMATRIX proj = mCamera.GetProj();
 
+    // Calculate unjittered ViewProj first (for velocity buffer and history)
+    XMMATRIX unjitteredViewProj = XMMatrixMultiply(view, proj);
+    
+    // Store current unjittered ViewProj as previous for NEXT frame BEFORE applying jitter
+    // This ensures velocity buffer uses consistent unjittered matrices
+    XMFLOAT4X4 currentUnjitteredViewProj;
+    XMStoreFloat4x4(&currentUnjitteredViewProj, XMMatrixTranspose(unjitteredViewProj));
+
     // Apply jitter to projection matrix for TAA
     // Jitter is applied to the projection matrix by offsetting the projection center
     if(mTaaEnabled && mTaa != nullptr)
@@ -748,7 +756,7 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
         proj.r[2].m128_f32[1] += jitter.y;
     }
 
-	XMMATRIX viewProj = XMMatrixMultiply(view, proj);
+	XMMATRIX viewProj = XMMatrixMultiply(view, proj);  // This is now jittered
 	XMMATRIX invView = XMMatrixInverse(&XMMatrixDeterminant(view), view);
 	XMMATRIX invProj = XMMatrixInverse(&XMMatrixDeterminant(proj), proj);
 	XMMATRIX invViewProj = XMMatrixInverse(&XMMatrixDeterminant(viewProj), viewProj);
@@ -767,10 +775,16 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
 	XMStoreFloat4x4(&mMainPassCB.InvView, XMMatrixTranspose(invView));
 	XMStoreFloat4x4(&mMainPassCB.Proj, XMMatrixTranspose(proj));
 	XMStoreFloat4x4(&mMainPassCB.InvProj, XMMatrixTranspose(invProj));
-	XMStoreFloat4x4(&mMainPassCB.ViewProj, XMMatrixTranspose(viewProj));
+    // Store unjittered ViewProj for velocity buffer rendering
+    XMStoreFloat4x4(&mMainPassCB.ViewProj, XMMatrixTranspose(unjitteredViewProj));
 	XMStoreFloat4x4(&mMainPassCB.InvViewProj, XMMatrixTranspose(invViewProj));
-    mMainPassCB.PrevViewProj = mPrevViewProj;  // Use stored previous ViewProj
+    mMainPassCB.PrevViewProj = mPrevViewProj;  // Use stored previous unjittered ViewProj
     XMStoreFloat4x4(&mMainPassCB.ViewProjTex, XMMatrixTranspose(viewProjTex));
+    // Store jittered ViewProj for main rendering (TAA sub-pixel sampling)
+    XMStoreFloat4x4(&mMainPassCB.JitteredViewProj, XMMatrixTranspose(viewProj));
+    
+    // Update previous ViewProj for next frame (unjittered)
+    mPrevViewProj = currentUnjitteredViewProj;
     XMStoreFloat4x4(&mMainPassCB.ShadowTransform, XMMatrixTranspose(shadowTransform));
 	mMainPassCB.EyePosW = mCamera.GetPosition3f();
 	mMainPassCB.RenderTargetSize = XMFLOAT2((float)mClientWidth, (float)mClientHeight);
@@ -863,9 +877,11 @@ void SsaoApp::UpdateTaaCB(const GameTimer& gt)
     // Get jitter for this frame
     XMFLOAT2 jitter = mTaa->GetJitterOffsetNDC(mFrameCount);
 
-    taaCB.PrevViewProj = mPrevViewProj;
+    // PrevViewProj is already updated in UpdateMainPassCB (before jitter applied)
+    // Use the same value that was stored in mMainPassCB.PrevViewProj
+    taaCB.PrevViewProj = mMainPassCB.PrevViewProj;
 
-    // Use unjittered ViewProj for TAA constants
+    // Use unjittered ViewProj for TAA constants (same as stored in mMainPassCB.ViewProj)
     XMMATRIX view = mCamera.GetView();
     XMMATRIX proj = mCamera.GetProj();  // Unjittered projection
     XMMATRIX viewProj = XMMatrixMultiply(view, proj);
@@ -881,8 +897,6 @@ void SsaoApp::UpdateTaaCB(const GameTimer& gt)
     auto currTaaCB = mCurrFrameResource->TaaCB.get();
     currTaaCB->CopyData(0, taaCB);
 
-    // Store current unjittered ViewProj for next frame (used in velocity buffer)
-    XMStoreFloat4x4(&mPrevViewProj, XMMatrixTranspose(viewProj));
     mPrevJitterOffset = jitter;
 }
 

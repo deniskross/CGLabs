@@ -53,8 +53,8 @@ VertexOut VS(VertexIn vin)
 	
 	vout.TangentW = mul(vin.TangentU, (float3x3)gWorld);
 
-    // Transform to homogeneous clip space.
-    vout.PosH = mul(posW, gViewProj);
+    // Transform to homogeneous clip space using jittered ViewProj for TAA
+    vout.PosH = mul(posW, gJitteredViewProj);
 
     // Generate projective tex-coords to project SSAO map onto scene.
     vout.SsaoPosH = mul(posW, gViewProjTex);

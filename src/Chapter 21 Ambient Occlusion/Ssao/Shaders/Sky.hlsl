@@ -32,7 +32,8 @@ VertexOut VS(VertexIn vin)
 	posW.xyz += gEyePosW;
 
 	// Set z = w so that z/w = 1 (i.e., skydome always on far plane).
-	vout.PosH = mul(posW, gViewProj).xyww;
+	// Use jittered ViewProj for TAA
+	vout.PosH = mul(posW, gJitteredViewProj).xyww;
 	
 	return vout;
 }
