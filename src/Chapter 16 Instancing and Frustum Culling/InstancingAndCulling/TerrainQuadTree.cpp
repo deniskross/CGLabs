@@ -4,6 +4,20 @@
 
 using namespace DirectX;
 
+// Helper: distance from point to axis-aligned box
+static float DistanceToBox(float px, float pz, float minX, float minZ, float maxX, float maxZ)
+{
+    float dx = 0.0f, dz = 0.0f;
+    
+    if (px < minX) dx = minX - px;
+    else if (px > maxX) dx = px - maxX;
+    
+    if (pz < minZ) dz = minZ - pz;
+    else if (pz > maxZ) dz = pz - maxZ;
+    
+    return sqrtf(dx * dx + dz * dz);
+}
+
 TerrainQuadTree::TerrainQuadTree()
 {
 }
@@ -19,15 +33,21 @@ void TerrainQuadTree::Initialize(float terrainWorldSize, float terrainMaxHeight,
     mFovY = fovY;
     mScreenHeight = screenHeight;
     
-    BuildTree();
+    // Distance thresholds for clipmap rings (centered on camera)
+    // Level 2 (finest): cells within this distance from camera
+    // Level 1 (medium): cells between level2 and level1 threshold
+    // Level 0 (coarsest): everything else
+    mLevelDistance[2] = mTerrainSize * 0.10f;  // ~77 units for 512 terrain
+    mLevelDistance[1] = mTerrainSize * 0.25f;  // ~180 units
+    mLevelDistance[0] = mTerrainSize * 2.0f;   // covers all
 }
 
 int TerrainQuadTree::GetTextureIndex(int level, int nodeX, int nodeZ)
 {
     // Texture array layout:
-    // [0] = Level 0 (003 folder - 1 tile)
+    // [0] = Level 0 (003 folder - 1 tile, coarsest)
     // [1-4] = Level 1 (002 folder - 2x2 tiles)
-    // [5-20] = Level 2 (001 folder - 4x4 tiles)
+    // [5-20] = Level 2 (001 folder - 4x4 tiles, finest)
     
     switch (level)
     {
@@ -42,60 +62,19 @@ int TerrainQuadTree::GetTextureIndex(int level, int nodeX, int nodeZ)
     }
 }
 
-void TerrainQuadTree::BuildTree()
+bool TerrainQuadTree::IsBlockVisible(float minX, float minZ, float maxX, float maxZ,
+                                      const BoundingFrustum& frustum)
 {
-    mRoot = std::make_unique<QuadTreeNode>();
-    float halfSize = mTerrainSize * 0.5f;
-    // Terrain goes from -halfSize to +halfSize in both X and Z
-    BuildNode(mRoot.get(), 0, 0, 0, -halfSize, -halfSize, halfSize, halfSize);
-}
-
-void TerrainQuadTree::BuildNode(QuadTreeNode* node, int level, int nodeX, int nodeZ,
-                                 float minX, float minZ, float maxX, float maxZ)
-{
-    node->Level = level;
-    node->NodeX = nodeX;
-    node->NodeZ = nodeZ;
-    node->MinX = minX;
-    node->MinZ = minZ;
-    node->MaxX = maxX;
-    node->MaxZ = maxZ;
+    float centerX = (minX + maxX) * 0.5f;
+    float centerZ = (minZ + maxZ) * 0.5f;
+    float halfSizeX = (maxX - minX) * 0.5f;
+    float halfSizeZ = (maxZ - minZ) * 0.5f;
     
-    int texIdx = GetTextureIndex(level, nodeX, nodeZ);
-    node->HeightMapIndex = texIdx;
-    node->DiffuseMapIndex = texIdx;
-    node->NormalMapIndex = texIdx;
+    XMFLOAT3 center(centerX, mTerrainHeight * 0.5f, centerZ);
+    XMFLOAT3 extents(halfSizeX, mTerrainHeight * 0.5f + 50.0f, halfSizeZ);
+    BoundingBox blockBounds(center, extents);
     
-    if (level < 2)
-    {
-        float midX = (minX + maxX) * 0.5f;
-        float midZ = (minZ + maxZ) * 0.5f;
-        
-        int childLevel = level + 1;
-        int childBaseX = nodeX * 2;
-        int childBaseZ = nodeZ * 2;
-        
-        // Children: SW(0,0), SE(1,0), NW(0,1), NE(1,1)
-        // SW - bottom left
-        node->Children[0] = std::make_unique<QuadTreeNode>();
-        BuildNode(node->Children[0].get(), childLevel, childBaseX, childBaseZ,
-                  minX, minZ, midX, midZ);
-        
-        // SE - bottom right
-        node->Children[1] = std::make_unique<QuadTreeNode>();
-        BuildNode(node->Children[1].get(), childLevel, childBaseX + 1, childBaseZ,
-                  midX, minZ, maxX, midZ);
-        
-        // NW - top left
-        node->Children[2] = std::make_unique<QuadTreeNode>();
-        BuildNode(node->Children[2].get(), childLevel, childBaseX, childBaseZ + 1,
-                  minX, midZ, midX, maxZ);
-        
-        // NE - top right
-        node->Children[3] = std::make_unique<QuadTreeNode>();
-        BuildNode(node->Children[3].get(), childLevel, childBaseX + 1, childBaseZ + 1,
-                  midX, midZ, maxX, maxZ);
-    }
+    return frustum.Contains(blockBounds) != DISJOINT;
 }
 
 void TerrainQuadTree::SelectTiles(
@@ -104,91 +83,184 @@ void TerrainQuadTree::SelectTiles(
     std::vector<TerrainTile>& outTiles)
 {
     outTiles.clear();
-    if (mRoot)
+    
+    float halfSize = mTerrainSize * 0.5f;
+    float camX = cameraPos.x;
+    float camZ = cameraPos.z;
+    
+    // =========================================================================
+    // Geometry Clipmaps: concentric rings of LOD around camera
+    // 
+    // The terrain is divided into a 4x4 grid (16 cells at finest level).
+    // Each cell is assigned ONE LOD based on distance to camera:
+    //   - Level 2 (finest): closest to camera, uses 001 textures (4x4)
+    //   - Level 1 (medium): middle ring, uses 002 textures (2x2)
+    //   - Level 0 (coarsest): outer ring, uses 003 texture (1x1)
+    // =========================================================================
+    
+    const int GRID_SIZE = 4;
+    float cellSize = mTerrainSize / GRID_SIZE;
+    
+    // Determine LOD for each cell based on distance
+    int cellLOD[GRID_SIZE][GRID_SIZE];
+    
+    for (int cz = 0; cz < GRID_SIZE; ++cz)
     {
-        SelectNode(mRoot.get(), cameraPos, worldFrustum, outTiles);
-    }
-}
-
-bool TerrainQuadTree::IsNodeVisible(QuadTreeNode* node, const BoundingFrustum& frustum)
-{
-    float centerX = (node->MinX + node->MaxX) * 0.5f;
-    float centerZ = (node->MinZ + node->MaxZ) * 0.5f;
-    float halfSizeX = (node->MaxX - node->MinX) * 0.5f;
-    float halfSizeZ = (node->MaxZ - node->MinZ) * 0.5f;
-    
-    XMFLOAT3 center(centerX, mTerrainHeight * 0.5f, centerZ);
-    XMFLOAT3 extents(halfSizeX, mTerrainHeight * 0.5f + 20.0f, halfSizeZ);
-    BoundingBox nodeBounds(center, extents);
-    
-    return frustum.Contains(nodeBounds) != DISJOINT;
-}
-
-float TerrainQuadTree::CalculateScreenSpaceError(QuadTreeNode* node, const XMFLOAT3& cameraPos)
-{
-    float centerX = (node->MinX + node->MaxX) * 0.5f;
-    float centerZ = (node->MinZ + node->MaxZ) * 0.5f;
-    
-    float dx = cameraPos.x - centerX;
-    float dy = cameraPos.y - mTerrainHeight * 0.5f;
-    float dz = cameraPos.z - centerZ;
-    float distance = sqrtf(dx * dx + dy * dy + dz * dz);
-    
-    if (distance < 1.0f)
-        distance = 1.0f;
-    
-    float geometricError = mGeometricError[node->Level];
-    float tanHalfFov = tanf(mFovY * 0.5f);
-    float screenSpaceError = (geometricError * mScreenHeight) / (2.0f * distance * tanHalfFov);
-    
-    return screenSpaceError;
-}
-
-void TerrainQuadTree::SelectNode(
-    QuadTreeNode* node,
-    const XMFLOAT3& cameraPos,
-    const BoundingFrustum& frustum,
-    std::vector<TerrainTile>& outTiles)
-{
-    if (!IsNodeVisible(node, frustum))
-        return;
-    
-    float screenError = CalculateScreenSpaceError(node, cameraPos);
-    bool shouldSubdivide = (screenError > mMaxScreenSpaceError) && node->HasChildren();
-    
-    if (shouldSubdivide)
-    {
-        for (int i = 0; i < 4; ++i)
+        for (int cx = 0; cx < GRID_SIZE; ++cx)
         {
-            if (node->Children[i])
-                SelectNode(node->Children[i].get(), cameraPos, frustum, outTiles);
+            float cellMinX = -halfSize + cx * cellSize;
+            float cellMinZ = -halfSize + cz * cellSize;
+            float cellMaxX = cellMinX + cellSize;
+            float cellMaxZ = cellMinZ + cellSize;
+            
+            // Distance from camera to closest point of cell
+            float dist = DistanceToBox(camX, camZ, cellMinX, cellMinZ, cellMaxX, cellMaxZ);
+            
+            // Assign LOD based on distance thresholds
+            if (dist < mLevelDistance[2])
+                cellLOD[cz][cx] = 2;  // Finest
+            else if (dist < mLevelDistance[1])
+                cellLOD[cz][cx] = 1;  // Medium
+            else
+                cellLOD[cz][cx] = 0;  // Coarsest
         }
     }
-    else
+    
+    // =========================================================================
+    // Emit tiles for each LOD level
+    // =========================================================================
+    
+    // --- Level 2 (finest): each cell maps 1:1 to a texture tile ---
+    for (int cz = 0; cz < GRID_SIZE; ++cz)
     {
-        TerrainTile tile;
-        tile.Level = node->Level;
-        tile.NodeX = node->NodeX;
-        tile.NodeZ = node->NodeZ;
-        tile.WorldMinX = node->MinX;
-        tile.WorldMinZ = node->MinZ;
-        tile.WorldSize = node->MaxX - node->MinX;
-        tile.HeightMapIndex = node->HeightMapIndex;
-        tile.DiffuseMapIndex = node->DiffuseMapIndex;
-        tile.NormalMapIndex = node->NormalMapIndex;
-        
-        // World transform: mesh is [0,1]x[0,1], scale to tile size and translate
-        XMMATRIX world = XMMatrixScaling(tile.WorldSize, 1.0f, tile.WorldSize) *
-                         XMMatrixTranslation(node->MinX, 0.0f, node->MinZ);
-        XMStoreFloat4x4(&tile.World, XMMatrixTranspose(world));
-        
-        outTiles.push_back(tile);
+        for (int cx = 0; cx < GRID_SIZE; ++cx)
+        {
+            if (cellLOD[cz][cx] != 2) continue;
+            
+            float cellMinX = -halfSize + cx * cellSize;
+            float cellMinZ = -halfSize + cz * cellSize;
+            float cellMaxX = cellMinX + cellSize;
+            float cellMaxZ = cellMinZ + cellSize;
+            
+            if (!IsBlockVisible(cellMinX, cellMinZ, cellMaxX, cellMaxZ, worldFrustum))
+                continue;
+            
+            TerrainTile tile;
+            tile.Level = 2;
+            tile.NodeX = cx;
+            tile.NodeZ = cz;
+            tile.WorldMinX = cellMinX;
+            tile.WorldMinZ = cellMinZ;
+            tile.WorldSize = cellSize;
+            
+            int texIdx = GetTextureIndex(2, cx, cz);
+            tile.HeightMapIndex = texIdx;
+            tile.DiffuseMapIndex = texIdx;
+            tile.NormalMapIndex = texIdx;
+            
+            // Level 2: each tile uses full texture (1:1 mapping)
+            tile.UVOffset = XMFLOAT2(0.0f, 0.0f);
+            tile.UVScale = XMFLOAT2(1.0f, 1.0f);
+            
+            XMMATRIX world = XMMatrixScaling(cellSize, 1.0f, cellSize) *
+                             XMMatrixTranslation(cellMinX, 0.0f, cellMinZ);
+            XMStoreFloat4x4(&tile.World, XMMatrixTranspose(world));
+            
+            outTiles.push_back(tile);
+        }
+    }
+    
+    // --- Level 1 (medium): 2x2 cells share one texture ---
+    // Each Level 1 texture covers 2x2 cells, so each cell uses 1/4 of the texture
+    for (int cz = 0; cz < GRID_SIZE; ++cz)
+    {
+        for (int cx = 0; cx < GRID_SIZE; ++cx)
+        {
+            if (cellLOD[cz][cx] != 1) continue;
+            
+            float cellMinX = -halfSize + cx * cellSize;
+            float cellMinZ = -halfSize + cz * cellSize;
+            float cellMaxX = cellMinX + cellSize;
+            float cellMaxZ = cellMinZ + cellSize;
+            
+            if (!IsBlockVisible(cellMinX, cellMinZ, cellMaxX, cellMaxZ, worldFrustum))
+                continue;
+            
+            TerrainTile tile;
+            tile.Level = 1;
+            tile.NodeX = cx / 2;
+            tile.NodeZ = cz / 2;
+            tile.WorldMinX = cellMinX;
+            tile.WorldMinZ = cellMinZ;
+            tile.WorldSize = cellSize;
+            
+            int texIdx = GetTextureIndex(1, cx / 2, cz / 2);
+            tile.HeightMapIndex = texIdx;
+            tile.DiffuseMapIndex = texIdx;
+            tile.NormalMapIndex = texIdx;
+            
+            // Level 1: each texture covers 2x2 cells
+            // Cell (cx, cz) uses portion based on (cx % 2, cz % 2)
+            int localX = cx % 2;
+            int localZ = cz % 2;
+            tile.UVOffset = XMFLOAT2(localX * 0.5f, localZ * 0.5f);
+            tile.UVScale = XMFLOAT2(0.5f, 0.5f);
+            
+            XMMATRIX world = XMMatrixScaling(cellSize, 1.0f, cellSize) *
+                             XMMatrixTranslation(cellMinX, 0.0f, cellMinZ);
+            XMStoreFloat4x4(&tile.World, XMMatrixTranspose(world));
+            
+            outTiles.push_back(tile);
+        }
+    }
+    
+    // --- Level 0 (coarsest): all cells share one texture ---
+    // The single Level 0 texture covers all 4x4 cells, so each cell uses 1/16 of the texture
+    for (int cz = 0; cz < GRID_SIZE; ++cz)
+    {
+        for (int cx = 0; cx < GRID_SIZE; ++cx)
+        {
+            if (cellLOD[cz][cx] != 0) continue;
+            
+            float cellMinX = -halfSize + cx * cellSize;
+            float cellMinZ = -halfSize + cz * cellSize;
+            float cellMaxX = cellMinX + cellSize;
+            float cellMaxZ = cellMinZ + cellSize;
+            
+            if (!IsBlockVisible(cellMinX, cellMinZ, cellMaxX, cellMaxZ, worldFrustum))
+                continue;
+            
+            TerrainTile tile;
+            tile.Level = 0;
+            tile.NodeX = 0;
+            tile.NodeZ = 0;
+            tile.WorldMinX = cellMinX;
+            tile.WorldMinZ = cellMinZ;
+            tile.WorldSize = cellSize;
+            
+            int texIdx = GetTextureIndex(0, 0, 0);
+            tile.HeightMapIndex = texIdx;
+            tile.DiffuseMapIndex = texIdx;
+            tile.NormalMapIndex = texIdx;
+            
+            // Level 0: single texture covers all 4x4 cells
+            // Cell (cx, cz) uses portion based on its position in the grid
+            tile.UVOffset = XMFLOAT2(cx * 0.25f, cz * 0.25f);
+            tile.UVScale = XMFLOAT2(0.25f, 0.25f);
+            
+            XMMATRIX world = XMMatrixScaling(cellSize, 1.0f, cellSize) *
+                             XMMatrixTranslation(cellMinX, 0.0f, cellMinZ);
+            XMStoreFloat4x4(&tile.World, XMMatrixTranspose(world));
+            
+            outTiles.push_back(tile);
+        }
     }
 }
 
 // Gaea exports tiles as Height_Out_y{row}_x{col}.dds
-// row 0 = bottom, row increases upward (positive Z in world)
-// col 0 = left, col increases rightward (positive X in world)
+// Level 0 (003): 1 texture, coarsest
+// Level 1 (002): 2x2 textures
+// Level 2 (001): 4x4 textures, finest
 std::wstring TerrainTextureInfo::GetHeightMapPath(int level, int nodeX, int nodeZ)
 {
     std::wstringstream ss;

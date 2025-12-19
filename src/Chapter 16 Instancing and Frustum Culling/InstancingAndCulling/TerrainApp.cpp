@@ -1,5 +1,7 @@
 //***************************************************************************************
-// TerrainApp.cpp - Simple terrain with distance-based LOD (no quadtree)
+// TerrainApp.cpp - Terrain with per-tile LOD using quadtree (Geometry Clipmaps style)
+// Based on: GPU Gems 2, Chapter 2 - Terrain Rendering Using GPU-Based Geometry Clipmaps
+// https://developer.nvidia.com/gpugems/gpugems2/part-i-geometric-complexity/chapter-2-terrain-rendering-using-gpu-based-geometry
 //***************************************************************************************
 
 #include "../../Common/d3dApp.h"
@@ -8,6 +10,7 @@
 #include "../../Common/GeometryGenerator.h"
 #include "../../Common/Camera.h"
 #include "FrameResource.h"
+#include "TerrainQuadTree.h"
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -30,32 +33,36 @@ struct TerrainConstants
     float TerrainRoughness;
 };
 
+// Constant buffer for compute shader brush parameters
+// Must match cbBrush layout in SculptBrush.hlsl exactly
+struct SculptBrushCB
+{
+    XMFLOAT2 BrushPosUV;     // Brush center in normalized UV coordinates [0,1]
+    float BrushRadius;       // Brush radius in UV space (not world space!)
+    float BrushStrength;     // Height delta per frame (positive values)
+    float TerrainSize;       // World-space terrain size for UV conversion
+    int BrushActive;         // Boolean flag for compute shader early exit
+    int BrushType;           // 0 = subtract height (dig), 1 = add height (raise)
+    float Pad;               // HLSL packing alignment
+};
+
 struct TerrainVertex
 {
     XMFLOAT3 Pos;
     XMFLOAT2 TexC;
 };
 
-// GPU instance data for terrain tiles
-struct TerrainTileInstance
+// GPU instance data for terrain tiles (matches TerrainTileInstance in TerrainQuadTree.h)
+struct TerrainTileInstanceGPU
 {
     XMFLOAT4X4 World;
     int HeightMapIndex;
     int DiffuseMapIndex;
     int NormalMapIndex;
     int LODLevel;
-};
-
-// Simple tile info for CPU
-struct SimpleTile
-{
-    int LODLevel;       // 0=003(1 tile), 1=002(4 tiles), 2=001(16 tiles)
-    int TileX, TileZ;   // Position in grid at this LOD level
-    float WorldMinX, WorldMinZ;
-    float WorldSize;
-    int HeightMapIndex;
-    int DiffuseMapIndex;
-    int NormalMapIndex;
+    // UV offset and scale for texture atlas lookup
+    XMFLOAT2 UVOffset;
+    XMFLOAT2 UVScale;
 };
 
 class TerrainApp : public D3DApp
@@ -91,13 +98,10 @@ private:
 
     std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> GetStaticSamplers();
 
-    // LOD helpers
-    int SelectLODLevel(float distanceToCamera);
-    int GetTextureIndex(int level, int tileX, int tileZ);
+    // Texture path helpers (use TerrainTextureInfo from TerrainQuadTree.h)
     std::wstring GetHeightMapPath(int level, int tileX, int tileZ);
     std::wstring GetDiffuseMapPath(int level, int tileX, int tileZ);
     std::wstring GetNormalMapPath(int level, int tileX, int tileZ);
-    bool IsTileVisible(const BoundingFrustum& frustum, float minX, float minZ, float maxX, float maxZ);
 
 private:
     std::vector<std::unique_ptr<FrameResource>> mFrameResources;
@@ -116,9 +120,12 @@ private:
 
     std::vector<D3D12_INPUT_ELEMENT_DESC> mTerrainInputLayout;
 
-    std::vector<SimpleTile> mVisibleTiles;
+    // Per-tile LOD selection using quadtree (Geometry Clipmaps approach)
+    TerrainQuadTree mQuadTree;
+    std::vector<TerrainTile> mVisibleTiles;
+    
     // Per-frame instance buffers to avoid GPU/CPU sync issues
-    std::unique_ptr<UploadBuffer<TerrainTileInstance>> mTileInstanceBuffers[gNumFrameResources];
+    std::unique_ptr<UploadBuffer<TerrainTileInstanceGPU>> mTileInstanceBuffers[gNumFrameResources];
     std::unique_ptr<UploadBuffer<TerrainConstants>> mTerrainCB;
 
     // Texture names in index order
@@ -130,23 +137,38 @@ private:
     float mTerrainHeight = 150.0f;
     int mPatchGridSize = 65;
 
-    // LOD distance thresholds with large hysteresis to prevent flickering
-    // When moving AWAY from terrain (increasing distance):
-    float mLOD2to1Distance = 350.0f;  // Switch from LOD2 to LOD1
-    float mLOD1to0Distance = 650.0f;  // Switch from LOD1 to LOD0
-    // When moving TOWARD terrain (decreasing distance):
-    float mLOD0to1Distance = 550.0f;  // Switch from LOD0 to LOD1
-    float mLOD1to2Distance = 250.0f;  // Switch from LOD1 to LOD2
-    
-    int mCurrentLOD = 2;  // Track current LOD level for hysteresis
-    float mLODSwitchCooldown = 0.0f;  // Cooldown timer to prevent rapid switching
-    const float mLODSwitchDelay = 0.3f;  // 300ms delay between LOD switches
-
     bool mWireframe = false;
     BoundingFrustum mCamFrustum;
     PassConstants mMainPassCB;
     Camera mCamera;
     POINT mLastMousePos;
+    
+    // Interactive terrain sculpting state
+    bool mSculptMode = false;           // P key toggles sculpt mode on/off
+    bool mSculpting = false;            // True while LMB held down in sculpt mode
+    int mSculptBrushType = 0;           // Brush operation: 0=dig holes, 1=raise mountains
+    float mBrushRadius = 0.05f;         // Brush size in UV space (5% of terrain)
+    float mBrushStrength = 0.002f;      // Height change per frame (world units)
+    
+    // R32_FLOAT texture storing height deltas (added to base heightmaps)
+    static const int SCULPT_MAP_SIZE = 512;
+    ComPtr<ID3D12Resource> mSculptMap;
+    ComPtr<ID3D12Resource> mSculptMapUpload;
+    
+    // GPU compute shader pipeline for real-time height modification
+    ComPtr<ID3D12RootSignature> mSculptRootSignature;  // CS root signature (CBV + UAV)
+    ComPtr<ID3D12PipelineState> mSculptPSO;            // Compute pipeline state object
+    std::unique_ptr<UploadBuffer<SculptBrushCB>> mSculptBrushCB;  // Per-frame brush params
+    
+    // Descriptor heap offsets for sculpt map binding
+    UINT mSculptMapUavIndex = 0;
+    UINT mSculptMapSrvIndex = 0;
+    
+    void BuildSculptResources();
+    void BuildSculptRootSignature();
+    void BuildSculptPSO();
+    void ApplySculptBrush(float brushX, float brushZ);
+    bool RaycastTerrain(int mouseX, int mouseY, XMFLOAT3& hitPoint);
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance, PSTR cmdLine, int showCmd)
@@ -193,13 +215,21 @@ bool TerrainApp::Initialize()
     mCamera.SetPosition(0.0f, mTerrainHeight + 100.0f, -mTerrainSize * 0.4f);
     mCamera.LookAt(mCamera.GetPosition3f(), XMFLOAT3(0.0f, 50.0f, 0.0f), XMFLOAT3(0.0f, 1.0f, 0.0f));
 
+    // Initialize the quadtree for per-tile LOD selection
+    // This implements the Geometry Clipmaps concept from GPU Gems 2, Chapter 2:
+    // Tiles closer to camera get higher detail (LOD2), farther tiles get lower detail (LOD0)
+    mQuadTree.Initialize(mTerrainSize, mTerrainHeight, 0.25f * MathHelper::Pi, (float)mClientHeight);
+
     LoadAllTerrainTextures();
+    BuildSculptResources();
     BuildRootSignature();
+    BuildSculptRootSignature();
     BuildDescriptorHeaps();
     BuildShadersAndInputLayout();
     BuildTerrainGeometry();
     BuildFrameResources();
     BuildPSOs();
+    BuildSculptPSO();
 
     ThrowIfFailed(mCommandList->Close());
     ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
@@ -244,6 +274,26 @@ void TerrainApp::Draw(const GameTimer& gt)
 
     auto pso = mWireframe ? mPSOs["terrain_wireframe"].Get() : mPSOs["terrain"].Get();
     ThrowIfFailed(mCommandList->Reset(cmdListAlloc.Get(), pso));
+    
+    // Set descriptor heaps early (needed for compute shader too)
+    ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvDescriptorHeap.Get() };
+    mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+    
+    // Real-time terrain modification via compute shader dispatch
+    if (mSculpting)
+    {
+        XMFLOAT3 hitPoint;
+        if (RaycastTerrain(mLastMousePos.x, mLastMousePos.y, hitPoint))
+        {
+            ApplySculptBrush(hitPoint.x, hitPoint.z);  // Dispatch CS with world coords
+        }
+        mCommandList->SetPipelineState(pso);  // Restore graphics PSO after CS dispatch
+    }
+    
+    // Resource state transition: sculpt map from COMMON to shader-readable
+    // NOTE: Using NON_PIXEL_SHADER_RESOURCE because vertex shader reads it
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        mSculptMap.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
 
     mCommandList->RSSetViewports(1, &mScreenViewport);
     mCommandList->RSSetScissorRects(1, &mScissorRect);
@@ -256,9 +306,7 @@ void TerrainApp::Draw(const GameTimer& gt)
 
     mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), true, &DepthStencilView());
 
-    ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvDescriptorHeap.Get() };
-    mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
-
+    // Descriptor heaps already set at the beginning of Draw()
     mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
 
     auto passCB = mCurrFrameResource->PassCB->Resource();
@@ -272,8 +320,17 @@ void TerrainApp::Draw(const GameTimer& gt)
     mCommandList->SetGraphicsRootDescriptorTable(4, texHandle);
     texHandle.Offset(gTotalTileTextures, mCbvSrvDescriptorSize);
     mCommandList->SetGraphicsRootDescriptorTable(5, texHandle);
+    
+    // Bind sculpt map SRV
+    CD3DX12_GPU_DESCRIPTOR_HANDLE sculptHandle(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+    sculptHandle.Offset(mSculptMapSrvIndex, mCbvSrvDescriptorSize);
+    mCommandList->SetGraphicsRootDescriptorTable(6, sculptHandle);
 
     DrawTerrain(mCommandList.Get());
+    
+    // Transition sculpt map back to common state
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        mSculptMap.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
 
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
         D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
@@ -295,21 +352,36 @@ void TerrainApp::OnMouseDown(WPARAM btnState, int x, int y)
     mLastMousePos.x = x;
     mLastMousePos.y = y;
     SetCapture(mhMainWnd);
+    
+    if (mSculptMode && (btnState & MK_LBUTTON))
+        mSculpting = true;
 }
 
 void TerrainApp::OnMouseUp(WPARAM btnState, int x, int y)
 {
     ReleaseCapture();
+    mSculpting = false;
 }
 
 void TerrainApp::OnMouseMove(WPARAM btnState, int x, int y)
 {
-    if ((btnState & MK_LBUTTON) != 0)
+    // Mouse input handling: different behavior based on current mode
+    if (mSculptMode && (btnState & MK_LBUTTON) != 0)
     {
+        // Sculpt mode: LMB triggers terrain modification
+        mSculpting = true;
+    }
+    else if ((btnState & MK_LBUTTON) != 0)
+    {
+        // Normal mode: LMB rotates camera (standard FPS controls)
         float dx = XMConvertToRadians(0.25f * static_cast<float>(x - mLastMousePos.x));
         float dy = XMConvertToRadians(0.25f * static_cast<float>(y - mLastMousePos.y));
         mCamera.Pitch(dy);
         mCamera.RotateY(dx);
+    }
+    else
+    {
+        mSculpting = false;  // Stop sculpting when LMB released
     }
     mLastMousePos.x = x;
     mLastMousePos.y = y;
@@ -339,82 +411,44 @@ void TerrainApp::OnKeyboardInput(const GameTimer& gt)
         mCamera.SetPosition(pos.x, pos.y - speed * dt, pos.z);
     }
 
-    if (GetAsyncKeyState('1') & 0x8000) mWireframe = false;
-    if (GetAsyncKeyState('2') & 0x8000) mWireframe = true;
+    // Context-sensitive key bindings: 1/2 keys change meaning based on current mode
+    if (mSculptMode)
+    {
+        // Sculpt mode: select brush operation type
+        if (GetAsyncKeyState('1') & 0x8000) mSculptBrushType = 0; // Subtractive brush (dig)
+        if (GetAsyncKeyState('2') & 0x8000) mSculptBrushType = 1; // Additive brush (raise)
+    }
+    else
+    {
+        // Normal mode: toggle rendering style
+        if (GetAsyncKeyState('1') & 0x8000) mWireframe = false;   // Solid rendering
+        if (GetAsyncKeyState('2') & 0x8000) mWireframe = true;    // Wireframe rendering
+    }
+    
+    // Toggle sculpt mode with P key
+    static bool pKeyWasDown = false;
+    bool pKeyIsDown = (GetAsyncKeyState('P') & 0x8000) != 0;
+    if (pKeyIsDown && !pKeyWasDown)
+    {
+        mSculptMode = !mSculptMode;
+    }
+    pKeyWasDown = pKeyIsDown;
+    
+    // Adjust brush size with [ and ]
+    if (GetAsyncKeyState(VK_OEM_4) & 0x8000) // [
+        mBrushRadius = max(0.01f, mBrushRadius - 0.001f);
+    if (GetAsyncKeyState(VK_OEM_6) & 0x8000) // ]
+        mBrushRadius = min(0.2f, mBrushRadius + 0.001f);
 
     mCamera.UpdateViewMatrix();
 }
 
-int TerrainApp::SelectLODLevel(float distanceToCamera)
-{
-    // LOD selection with hysteresis and cooldown to prevent flickering
-    // Don't switch LOD if cooldown is active
-    if (mLODSwitchCooldown > 0.0f)
-        return mCurrentLOD;
-    
-    int newLOD = mCurrentLOD;
-    
-    if (mCurrentLOD == 0)
-    {
-        // Currently at LOD0 (far), check if should switch to LOD1
-        if (distanceToCamera < mLOD0to1Distance)
-            newLOD = 1;
-    }
-    else if (mCurrentLOD == 1)
-    {
-        // Currently at LOD1 (medium)
-        if (distanceToCamera > mLOD1to0Distance)
-            newLOD = 0;  // Moving away -> LOD0
-        else if (distanceToCamera < mLOD1to2Distance)
-            newLOD = 2;  // Moving closer -> LOD2
-    }
-    else // mCurrentLOD == 2
-    {
-        // Currently at LOD2 (close), check if should switch to LOD1
-        if (distanceToCamera > mLOD2to1Distance)
-            newLOD = 1;
-    }
-    
-    // If LOD changed, start cooldown
-    if (newLOD != mCurrentLOD)
-    {
-        mCurrentLOD = newLOD;
-        mLODSwitchCooldown = mLODSwitchDelay;
-    }
-    
-    return mCurrentLOD;
-}
-
-int TerrainApp::GetTextureIndex(int level, int tileX, int tileZ)
-{
-    // Level 0: index 0 (003 folder - 1 tile)
-    // Level 1: indices 1-4 (002 folder - 2x2 tiles)
-    // Level 2: indices 5-20 (001 folder - 4x4 tiles)
-    if (level == 0)
-        return 0;
-    else if (level == 1)
-        return 1 + tileZ * 2 + tileX;
-    else
-        return 5 + tileZ * 4 + tileX;
-}
-
-bool TerrainApp::IsTileVisible(const BoundingFrustum& frustum, float minX, float minZ, float maxX, float maxZ)
-{
-    // Create AABB for the tile (use full height range)
-    BoundingBox box;
-    XMFLOAT3 center((minX + maxX) * 0.5f, mTerrainHeight * 0.5f, (minZ + maxZ) * 0.5f);
-    XMFLOAT3 extents((maxX - minX) * 0.5f, mTerrainHeight * 0.5f, (maxZ - minZ) * 0.5f);
-    box.Center = center;
-    box.Extents = extents;
-    
-    return frustum.Contains(box) != ContainmentType::DISJOINT;
-}
-
 void TerrainApp::UpdateTerrainInstances(const GameTimer& gt)
 {
-    // Update LOD switch cooldown
-    if (mLODSwitchCooldown > 0.0f)
-        mLODSwitchCooldown -= gt.DeltaTime();
+    // Use the quadtree for per-tile LOD selection
+    // This implements the Geometry Clipmaps concept from GPU Gems 2, Chapter 2:
+    // Each tile independently selects its LOD based on distance to camera,
+    // so close tiles are highly detailed while distant tiles are coarser.
     
     XMMATRIX view = mCamera.GetView();
     XMMATRIX invView = XMMatrixInverse(&XMMatrixDeterminant(view), view);
@@ -425,132 +459,47 @@ void TerrainApp::UpdateTerrainInstances(const GameTimer& gt)
 
     XMFLOAT3 camPos = mCamera.GetPosition3f();
     
-    // Calculate distance from camera to terrain center
-    float terrainCenterX = 0.0f;
-    float terrainCenterZ = 0.0f;
-    float dx = camPos.x - terrainCenterX;
-    float dz = camPos.z - terrainCenterZ;
-    float distToCenter = sqrtf(dx * dx + dz * dz);
-    
-    // Select LOD based on distance
-    int lodLevel = SelectLODLevel(distToCenter);
-    
-    mVisibleTiles.clear();
-    
-    // Terrain bounds: centered at origin, size = mTerrainSize
-    float halfSize = mTerrainSize * 0.5f;
-    float terrainMinX = -halfSize;
-    float terrainMinZ = -halfSize;
-    
-    if (lodLevel == 0)
-    {
-        // LOD0: Single tile covering entire terrain
-        if (IsTileVisible(worldFrustum, terrainMinX, terrainMinZ, terrainMinX + mTerrainSize, terrainMinZ + mTerrainSize))
-        {
-            SimpleTile tile;
-            tile.LODLevel = 0;
-            tile.TileX = 0;
-            tile.TileZ = 0;
-            tile.WorldMinX = terrainMinX;
-            tile.WorldMinZ = terrainMinZ;
-            tile.WorldSize = mTerrainSize;
-            tile.HeightMapIndex = GetTextureIndex(0, 0, 0);
-            tile.DiffuseMapIndex = tile.HeightMapIndex;
-            tile.NormalMapIndex = tile.HeightMapIndex;
-            mVisibleTiles.push_back(tile);
-        }
-    }
-    else if (lodLevel == 1)
-    {
-        // LOD1: 2x2 tiles
-        float tileSize = mTerrainSize / 2.0f;
-        for (int z = 0; z < 2; ++z)
-        {
-            for (int x = 0; x < 2; ++x)
-            {
-                float minX = terrainMinX + x * tileSize;
-                float minZ = terrainMinZ + z * tileSize;
-                
-                if (IsTileVisible(worldFrustum, minX, minZ, minX + tileSize, minZ + tileSize))
-                {
-                    SimpleTile tile;
-                    tile.LODLevel = 1;
-                    tile.TileX = x;
-                    tile.TileZ = z;
-                    tile.WorldMinX = minX;
-                    tile.WorldMinZ = minZ;
-                    tile.WorldSize = tileSize;
-                    tile.HeightMapIndex = GetTextureIndex(1, x, z);
-                    tile.DiffuseMapIndex = tile.HeightMapIndex;
-                    tile.NormalMapIndex = tile.HeightMapIndex;
-                    mVisibleTiles.push_back(tile);
-                }
-            }
-        }
-    }
-    else
-    {
-        // LOD2: 4x4 tiles
-        float tileSize = mTerrainSize / 4.0f;
-        for (int z = 0; z < 4; ++z)
-        {
-            for (int x = 0; x < 4; ++x)
-            {
-                float minX = terrainMinX + x * tileSize;
-                float minZ = terrainMinZ + z * tileSize;
-                
-                if (IsTileVisible(worldFrustum, minX, minZ, minX + tileSize, minZ + tileSize))
-                {
-                    SimpleTile tile;
-                    tile.LODLevel = 2;
-                    tile.TileX = x;
-                    tile.TileZ = z;
-                    tile.WorldMinX = minX;
-                    tile.WorldMinZ = minZ;
-                    tile.WorldSize = tileSize;
-                    tile.HeightMapIndex = GetTextureIndex(2, x, z);
-                    tile.DiffuseMapIndex = tile.HeightMapIndex;
-                    tile.NormalMapIndex = tile.HeightMapIndex;
-                    mVisibleTiles.push_back(tile);
-                }
-            }
-        }
-    }
+    // The quadtree traverses the terrain hierarchy and selects tiles based on
+    // screen-space error: tiles with too much error get subdivided, others are rendered.
+    // This naturally creates a "nested grid" pattern where close areas are detailed.
+    mQuadTree.SelectTiles(camPos, worldFrustum, mVisibleTiles);
 
-    // Upload instance data
+    // Upload instance data to GPU
     for (size_t i = 0; i < mVisibleTiles.size() && i < 64; ++i)
     {
-        const SimpleTile& tile = mVisibleTiles[i];
+        const TerrainTile& tile = mVisibleTiles[i];
         
-        // World matrix: scale and translate
-        XMMATRIX scale = XMMatrixScaling(tile.WorldSize, 1.0f, tile.WorldSize);
-        XMMATRIX translate = XMMatrixTranslation(tile.WorldMinX, 0.0f, tile.WorldMinZ);
-        XMMATRIX world = scale * translate;
-        
-        TerrainTileInstance inst;
-        XMStoreFloat4x4(&inst.World, XMMatrixTranspose(world));
+        TerrainTileInstanceGPU inst;
+        inst.World = tile.World;
         inst.HeightMapIndex = tile.HeightMapIndex;
         inst.DiffuseMapIndex = tile.DiffuseMapIndex;
         inst.NormalMapIndex = tile.NormalMapIndex;
-        inst.LODLevel = tile.LODLevel;
+        inst.LODLevel = tile.Level;
+        inst.UVOffset = tile.UVOffset;
+        inst.UVScale = tile.UVScale;
         
         mTileInstanceBuffers[mCurrFrameResourceIndex]->CopyData((int)i, inst);
     }
 
-    // Update window title
+    // Update window title with LOD statistics
     int countL0 = 0, countL1 = 0, countL2 = 0;
     for (const auto& t : mVisibleTiles)
     {
-        if (t.LODLevel == 0) countL0++;
-        else if (t.LODLevel == 1) countL1++;
+        if (t.Level == 0) countL0++;
+        else if (t.Level == 1) countL1++;
         else countL2++;
     }
 
     std::wostringstream outs;
-    outs << L"Terrain LOD - Tiles: " << mVisibleTiles.size()
-         << L" (L0:" << countL0 << L" L1:" << countL1 << L" L2:" << countL2 << L")"
-         << L" Dist:" << (int)distToCenter
-         << L" | 1/2=Solid/Wire | WASD+QE";
+    outs << L"Terrain Clipmap LOD - Tiles: " << mVisibleTiles.size()
+         << L" (L0:" << countL0 << L" L1:" << countL1 << L" L2:" << countL2 << L")";
+    if (mSculptMode)
+    {
+        outs << L" | SCULPT: " << (mSculptBrushType == 0 ? L"DIG(1)" : L"RAISE(2)");
+        outs << L" r=" << mBrushRadius << L" [/]=size | P=exit";
+    }
+    else
+        outs << L" | P=Sculpt | 1/2=Solid/Wire | WASD+QE+Mouse";
     mMainWndCaption = outs.str();
 }
 
@@ -693,7 +642,7 @@ void TerrainApp::LoadAllTerrainTextures()
     {
         for (int x = 0; x < 2; ++x)
         {
-            int idx = GetTextureIndex(1, x, z);
+            int idx = TerrainQuadTree::GetTextureIndex(1, x, z);
             std::string suffix = std::to_string(idx);
             
             LoadTex(GetHeightMapPath(1, x, z), "h_" + suffix);
@@ -711,7 +660,7 @@ void TerrainApp::LoadAllTerrainTextures()
     {
         for (int x = 0; x < 4; ++x)
         {
-            int idx = GetTextureIndex(2, x, z);
+            int idx = TerrainQuadTree::GetTextureIndex(2, x, z);
             std::string suffix = std::to_string(idx);
             
             LoadTex(GetHeightMapPath(2, x, z), "h_" + suffix);
@@ -735,18 +684,22 @@ void TerrainApp::BuildRootSignature()
     
     CD3DX12_DESCRIPTOR_RANGE normalTable;
     normalTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, gTotalTileTextures, 42, 0);
+    
+    CD3DX12_DESCRIPTOR_RANGE sculptTable;
+    sculptTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 63, 0); // t63 for sculpt map
 
-    CD3DX12_ROOT_PARAMETER slotRootParameter[6];
+    CD3DX12_ROOT_PARAMETER slotRootParameter[7];
     slotRootParameter[0].InitAsConstantBufferView(0);
     slotRootParameter[1].InitAsConstantBufferView(1);
     slotRootParameter[2].InitAsShaderResourceView(0, 1);
     slotRootParameter[3].InitAsDescriptorTable(1, &heightTable, D3D12_SHADER_VISIBILITY_VERTEX);
     slotRootParameter[4].InitAsDescriptorTable(1, &diffuseTable, D3D12_SHADER_VISIBILITY_PIXEL);
     slotRootParameter[5].InitAsDescriptorTable(1, &normalTable, D3D12_SHADER_VISIBILITY_ALL);
+    slotRootParameter[6].InitAsDescriptorTable(1, &sculptTable, D3D12_SHADER_VISIBILITY_VERTEX);
 
     auto staticSamplers = GetStaticSamplers();
 
-    CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(6, slotRootParameter,
+    CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(7, slotRootParameter,
         (UINT)staticSamplers.size(), staticSamplers.data(),
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
@@ -767,8 +720,9 @@ void TerrainApp::BuildRootSignature()
 
 void TerrainApp::BuildDescriptorHeaps()
 {
+    // +2 for sculpt map (1 SRV + 1 UAV)
     D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-    srvHeapDesc.NumDescriptors = gTotalTileTextures * 3;
+    srvHeapDesc.NumDescriptors = gTotalTileTextures * 3 + 2;
     srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&mSrvDescriptorHeap)));
@@ -816,6 +770,26 @@ void TerrainApp::BuildDescriptorHeaps()
         }
         hDescriptor.Offset(1, mCbvSrvDescriptorSize);
     }
+    
+    // Sculpt map SRV (for vertex shader to read)
+    mSculptMapSrvIndex = gTotalTileTextures * 3;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sculptSrvDesc = {};
+    sculptSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sculptSrvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    sculptSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sculptSrvDesc.Texture2D.MostDetailedMip = 0;
+    sculptSrvDesc.Texture2D.MipLevels = 1;
+    sculptSrvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+    md3dDevice->CreateShaderResourceView(mSculptMap.Get(), &sculptSrvDesc, hDescriptor);
+    hDescriptor.Offset(1, mCbvSrvDescriptorSize);
+    
+    // Sculpt map UAV (for compute shader to write)
+    mSculptMapUavIndex = gTotalTileTextures * 3 + 1;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC sculptUavDesc = {};
+    sculptUavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    sculptUavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    sculptUavDesc.Texture2D.MipSlice = 0;
+    md3dDevice->CreateUnorderedAccessView(mSculptMap.Get(), nullptr, &sculptUavDesc, hDescriptor);
 }
 
 void TerrainApp::BuildShadersAndInputLayout()
@@ -833,18 +807,25 @@ void TerrainApp::BuildShadersAndInputLayout()
 
 void TerrainApp::BuildTerrainGeometry()
 {
-    // Create unit grid [0,1] x [0,1]
-    // Vertex shader will scale and translate based on instance world matrix
+    // Create unit grid [0,1] x [0,1] with skirts on all 4 edges
+    // Skirts are vertical strips that hang down to hide gaps between LOD levels
     int gridSize = mPatchGridSize;
     float step = 1.0f / (gridSize - 1);
     
-    int vertexCount = gridSize * gridSize;
-    int indexCount = (gridSize - 1) * (gridSize - 1) * 6;
+    // Main grid vertices + skirt vertices (4 edges, each edge has gridSize vertices)
+    int mainVertexCount = gridSize * gridSize;
+    int skirtVertexCount = gridSize * 4; // 4 edges
+    int vertexCount = mainVertexCount + skirtVertexCount;
+    
+    // Main grid indices + skirt indices (4 edges, each edge has (gridSize-1) quads = (gridSize-1)*6 indices)
+    int mainIndexCount = (gridSize - 1) * (gridSize - 1) * 6;
+    int skirtIndexCount = (gridSize - 1) * 4 * 6; // 4 edges
+    int indexCount = mainIndexCount + skirtIndexCount;
 
     std::vector<TerrainVertex> vertices(vertexCount);
     std::vector<std::uint32_t> indices(indexCount);
 
-    // Create vertices
+    // Create main grid vertices (Y=0, will be displaced by heightmap in shader)
     for (int z = 0; z < gridSize; ++z)
     {
         for (int x = 0; x < gridSize; ++x)
@@ -854,8 +835,44 @@ void TerrainApp::BuildTerrainGeometry()
             vertices[i].TexC = XMFLOAT2(x * step, z * step);
         }
     }
+    
+    // Create skirt vertices (Y=-1, shader will recognize and drop them down)
+    // Skirt vertices have same XZ and UV as edge vertices, but Y=-1 marks them as skirt
+    int skirtBase = mainVertexCount;
+    
+    // Bottom edge (z=0)
+    for (int x = 0; x < gridSize; ++x)
+    {
+        int i = skirtBase + x;
+        vertices[i].Pos = XMFLOAT3(x * step, -1.0f, 0.0f);
+        vertices[i].TexC = XMFLOAT2(x * step, 0.0f);
+    }
+    
+    // Top edge (z=gridSize-1)
+    for (int x = 0; x < gridSize; ++x)
+    {
+        int i = skirtBase + gridSize + x;
+        vertices[i].Pos = XMFLOAT3(x * step, -1.0f, 1.0f);
+        vertices[i].TexC = XMFLOAT2(x * step, 1.0f);
+    }
+    
+    // Left edge (x=0)
+    for (int z = 0; z < gridSize; ++z)
+    {
+        int i = skirtBase + gridSize * 2 + z;
+        vertices[i].Pos = XMFLOAT3(0.0f, -1.0f, z * step);
+        vertices[i].TexC = XMFLOAT2(0.0f, z * step);
+    }
+    
+    // Right edge (x=gridSize-1)
+    for (int z = 0; z < gridSize; ++z)
+    {
+        int i = skirtBase + gridSize * 3 + z;
+        vertices[i].Pos = XMFLOAT3(1.0f, -1.0f, z * step);
+        vertices[i].TexC = XMFLOAT2(1.0f, z * step);
+    }
 
-    // Create indices
+    // Create main grid indices
     int idx = 0;
     for (int z = 0; z < gridSize - 1; ++z)
     {
@@ -873,6 +890,73 @@ void TerrainApp::BuildTerrainGeometry()
             indices[idx++] = bl;
             indices[idx++] = br;
         }
+    }
+    
+    // Create skirt indices - connect edge vertices to skirt vertices
+    // Bottom edge skirt (hangs down from z=0 edge)
+    for (int x = 0; x < gridSize - 1; ++x)
+    {
+        int edgeL = x;                          // main grid vertex
+        int edgeR = x + 1;                      // main grid vertex
+        int skirtL = skirtBase + x;             // skirt vertex
+        int skirtR = skirtBase + x + 1;         // skirt vertex
+        
+        // Two triangles forming quad (winding for front face when viewed from outside)
+        indices[idx++] = skirtL;
+        indices[idx++] = edgeL;
+        indices[idx++] = skirtR;
+        indices[idx++] = skirtR;
+        indices[idx++] = edgeL;
+        indices[idx++] = edgeR;
+    }
+    
+    // Top edge skirt (hangs down from z=gridSize-1 edge)
+    for (int x = 0; x < gridSize - 1; ++x)
+    {
+        int edgeL = (gridSize - 1) * gridSize + x;
+        int edgeR = edgeL + 1;
+        int skirtL = skirtBase + gridSize + x;
+        int skirtR = skirtL + 1;
+        
+        // Opposite winding
+        indices[idx++] = edgeL;
+        indices[idx++] = skirtL;
+        indices[idx++] = edgeR;
+        indices[idx++] = edgeR;
+        indices[idx++] = skirtL;
+        indices[idx++] = skirtR;
+    }
+    
+    // Left edge skirt (hangs down from x=0 edge)
+    for (int z = 0; z < gridSize - 1; ++z)
+    {
+        int edgeB = z * gridSize;
+        int edgeT = (z + 1) * gridSize;
+        int skirtB = skirtBase + gridSize * 2 + z;
+        int skirtT = skirtB + 1;
+        
+        indices[idx++] = edgeB;
+        indices[idx++] = skirtB;
+        indices[idx++] = edgeT;
+        indices[idx++] = edgeT;
+        indices[idx++] = skirtB;
+        indices[idx++] = skirtT;
+    }
+    
+    // Right edge skirt (hangs down from x=gridSize-1 edge)
+    for (int z = 0; z < gridSize - 1; ++z)
+    {
+        int edgeB = z * gridSize + (gridSize - 1);
+        int edgeT = (z + 1) * gridSize + (gridSize - 1);
+        int skirtB = skirtBase + gridSize * 3 + z;
+        int skirtT = skirtB + 1;
+        
+        indices[idx++] = skirtB;
+        indices[idx++] = edgeB;
+        indices[idx++] = skirtT;
+        indices[idx++] = skirtT;
+        indices[idx++] = edgeB;
+        indices[idx++] = edgeT;
     }
 
     const UINT vbByteSize = (UINT)vertices.size() * sizeof(TerrainVertex);
@@ -940,7 +1024,7 @@ void TerrainApp::BuildFrameResources()
     {
         mFrameResources.push_back(std::make_unique<FrameResource>(md3dDevice.Get(), 1, 64, 1));
         // Create per-frame instance buffer to avoid GPU/CPU sync issues
-        mTileInstanceBuffers[i] = std::make_unique<UploadBuffer<TerrainTileInstance>>(md3dDevice.Get(), 64, false);
+        mTileInstanceBuffers[i] = std::make_unique<UploadBuffer<TerrainTileInstanceGPU>>(md3dDevice.Get(), 64, false);
     }
 
     mTerrainCB = std::make_unique<UploadBuffer<TerrainConstants>>(md3dDevice.Get(), 1, true);
@@ -984,4 +1068,217 @@ std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> TerrainApp::GetStaticSamplers()
         D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 0.0f, 16);
 
     return { pointClamp, linearClamp, linearWrap, anisotropicWrap, anisotropicClamp, anisotropic16 };
+}
+
+// Terrain sculpting implementation
+
+void TerrainApp::BuildSculptResources()
+{
+    // Create sculpt map texture (R32_FLOAT, stores height modifications)
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = SCULPT_MAP_SIZE;
+    texDesc.Height = SCULPT_MAP_SIZE;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Quality = 0;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    
+    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    
+    ThrowIfFailed(md3dDevice->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &texDesc,
+        D3D12_RESOURCE_STATE_COMMON,
+        nullptr,
+        IID_PPV_ARGS(&mSculptMap)));
+    
+    mSculptMap->SetName(L"SculptMap");
+    
+    // Create upload buffer for initial clear (all zeros)
+    const UINT64 uploadBufferSize = GetRequiredIntermediateSize(mSculptMap.Get(), 0, 1);
+    CD3DX12_HEAP_PROPERTIES uploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
+    CD3DX12_RESOURCE_DESC uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize);
+    
+    ThrowIfFailed(md3dDevice->CreateCommittedResource(
+        &uploadHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &uploadBufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&mSculptMapUpload)));
+    
+    // Initialize sculpt map to zeros
+    std::vector<float> zeroData(SCULPT_MAP_SIZE * SCULPT_MAP_SIZE, 0.0f);
+    
+    D3D12_SUBRESOURCE_DATA subresourceData = {};
+    subresourceData.pData = zeroData.data();
+    subresourceData.RowPitch = SCULPT_MAP_SIZE * sizeof(float);
+    subresourceData.SlicePitch = subresourceData.RowPitch * SCULPT_MAP_SIZE;
+    
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        mSculptMap.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST));
+    
+    UpdateSubresources(mCommandList.Get(), mSculptMap.Get(), mSculptMapUpload.Get(), 0, 0, 1, &subresourceData);
+    
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        mSculptMap.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON));
+    
+    // Create constant buffer for brush parameters
+    mSculptBrushCB = std::make_unique<UploadBuffer<SculptBrushCB>>(md3dDevice.Get(), 1, true);
+}
+
+void TerrainApp::BuildSculptRootSignature()
+{
+    CD3DX12_DESCRIPTOR_RANGE uavTable;
+    uavTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
+    
+    CD3DX12_ROOT_PARAMETER slotRootParameter[2];
+    slotRootParameter[0].InitAsConstantBufferView(0);
+    slotRootParameter[1].InitAsDescriptorTable(1, &uavTable);
+    
+    CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(2, slotRootParameter, 0, nullptr,
+        D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    
+    ComPtr<ID3DBlob> serializedRootSig = nullptr;
+    ComPtr<ID3DBlob> errorBlob = nullptr;
+    HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+        serializedRootSig.GetAddressOf(), errorBlob.GetAddressOf());
+    
+    if (errorBlob != nullptr)
+        ::OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+    ThrowIfFailed(hr);
+    
+    ThrowIfFailed(md3dDevice->CreateRootSignature(0,
+        serializedRootSig->GetBufferPointer(),
+        serializedRootSig->GetBufferSize(),
+        IID_PPV_ARGS(&mSculptRootSignature)));
+}
+
+void TerrainApp::BuildSculptPSO()
+{
+    mShaders["sculptCS"] = d3dUtil::CompileShader(L"Shaders\\SculptBrush.hlsl", nullptr, "CS", "cs_5_1");
+    
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = mSculptRootSignature.Get();
+    psoDesc.CS = { reinterpret_cast<BYTE*>(mShaders["sculptCS"]->GetBufferPointer()),
+                   mShaders["sculptCS"]->GetBufferSize() };
+    psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+    
+    ThrowIfFailed(md3dDevice->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&mSculptPSO)));
+}
+
+void TerrainApp::ApplySculptBrush(float worldX, float worldZ)
+{
+    // World-to-UV coordinate transformation: world ∈ [-size/2, size/2] → UV ∈ [0,1]
+    // Formula: UV = (world + size/2) / size
+    float halfSize = mTerrainSize * 0.5f;
+    float u = (worldX + halfSize) / mTerrainSize;
+    float v = (worldZ + halfSize) / mTerrainSize;
+    
+    // Clamp to texture bounds (prevent out-of-bounds access)
+    u = max(0.0f, min(1.0f, u));
+    v = max(0.0f, min(1.0f, v));
+    
+    // Upload brush parameters to GPU constant buffer
+    SculptBrushCB brushCB;
+    brushCB.BrushPosUV = XMFLOAT2(u, v);        // Brush center in texture space
+    brushCB.BrushRadius = mBrushRadius;          // Radius in UV units (not pixels!)
+    brushCB.BrushStrength = mBrushStrength;      // Height delta magnitude
+    brushCB.TerrainSize = mTerrainSize;          // For potential world-space calculations
+    brushCB.BrushActive = 1;                     // Enable brush in compute shader
+    brushCB.BrushType = mSculptBrushType;        // Operation type (add/subtract)
+    brushCB.Pad = 0.0f;
+    mSculptBrushCB->CopyData(0, brushCB);
+    
+    // Execute compute shader to modify height texture
+    auto cmdListAlloc = mCurrFrameResource->CmdListAlloc;
+    
+    // Resource state management: enable UAV writes to sculpt map
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        mSculptMap.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    
+    // Bind compute pipeline and root signature
+    mCommandList->SetPipelineState(mSculptPSO.Get());
+    mCommandList->SetComputeRootSignature(mSculptRootSignature.Get());
+    
+    // Bind constant buffer (brush parameters)
+    mCommandList->SetComputeRootConstantBufferView(0, mSculptBrushCB->Resource()->GetGPUVirtualAddress());
+    
+    // Bind UAV descriptor (writable sculpt map texture)
+    CD3DX12_GPU_DESCRIPTOR_HANDLE uavHandle(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+    uavHandle.Offset(mSculptMapUavIndex, mCbvSrvDescriptorSize);
+    mCommandList->SetComputeRootDescriptorTable(1, uavHandle);
+    
+    // Dispatch compute threads: ceil(512/8) = 64 groups per dimension
+    // Total threads: 64×64×8×8 = 262,144 threads for 512×512 texture
+    UINT numGroupsX = (SCULPT_MAP_SIZE + 7) / 8;  // Integer ceiling division
+    UINT numGroupsY = (SCULPT_MAP_SIZE + 7) / 8;
+    mCommandList->Dispatch(numGroupsX, numGroupsY, 1);
+    
+    // Restore resource state for next frame's vertex shader reads
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        mSculptMap.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON));
+}
+
+bool TerrainApp::RaycastTerrain(int mouseX, int mouseY, XMFLOAT3& hitPoint)
+{
+    // Screen-to-world ray casting for mouse picking
+    // Step 1: Convert screen coordinates to NDC space
+    // NDC: x,y ∈ [-1,1], z ∈ [0,1] (D3D12 convention)
+    float ndcX = (2.0f * mouseX / mClientWidth - 1.0f);   // [0,width] → [-1,1]
+    float ndcY = (1.0f - 2.0f * mouseY / mClientHeight);  // [0,height] → [1,-1] (flip Y)
+    
+    // Step 2: Compute inverse view-projection matrix for unprojection
+    XMMATRIX view = mCamera.GetView();
+    XMMATRIX proj = mCamera.GetProj();
+    XMMATRIX viewProj = XMMatrixMultiply(view, proj);
+    XMMATRIX invViewProj = XMMatrixInverse(&XMMatrixDeterminant(viewProj), viewProj);
+    
+    // Step 3: Create ray in world space by unprojecting near/far points
+    // Near plane (z=0) and far plane (z=1) in NDC
+    XMVECTOR rayOriginNDC = XMVectorSet(ndcX, ndcY, 0.0f, 1.0f);  // Near plane
+    XMVECTOR rayEndNDC = XMVectorSet(ndcX, ndcY, 1.0f, 1.0f);     // Far plane
+    
+    // Transform from NDC to world space using inverse view-projection
+    XMVECTOR rayOriginWorld = XMVector3TransformCoord(rayOriginNDC, invViewProj);
+    XMVECTOR rayEndWorld = XMVector3TransformCoord(rayEndNDC, invViewProj);
+    XMVECTOR rayDir = XMVector3Normalize(rayEndWorld - rayOriginWorld);
+    
+    // Step 4: Ray-plane intersection (simplified terrain collision)
+    // Assumption: terrain lies on horizontal plane at average height
+    // TODO: Could implement proper ray-heightmap intersection for accuracy
+    float avgHeight = mTerrainHeight * 0.3f;  // Empirical average terrain height
+    
+    XMFLOAT3 origin, dir;
+    XMStoreFloat3(&origin, rayOriginWorld);
+    XMStoreFloat3(&dir, rayDir);
+    
+    // Ray equation: P(t) = origin + t * dir
+    // Plane equation: Y = avgHeight
+    // Intersection: origin.y + t * dir.y = avgHeight
+    // Solve for t: t = (avgHeight - origin.y) / dir.y
+    if (fabsf(dir.y) < 0.0001f)
+        return false;  // Ray parallel to plane (no intersection)
+    
+    float t = (avgHeight - origin.y) / dir.y;
+    if (t < 0.0f)
+        return false;  // Intersection behind camera (negative t)
+    
+    // Compute 3D intersection point
+    hitPoint.x = origin.x + t * dir.x;
+    hitPoint.y = avgHeight;
+    hitPoint.z = origin.z + t * dir.z;
+    
+    // Step 5: Bounds checking - ensure hit point is within terrain area
+    float halfSize = mTerrainSize * 0.5f;
+    if (hitPoint.x < -halfSize || hitPoint.x > halfSize ||
+        hitPoint.z < -halfSize || hitPoint.z > halfSize)
+        return false;  // Outside terrain bounds
+    
+    return true;  // Valid intersection found
 }

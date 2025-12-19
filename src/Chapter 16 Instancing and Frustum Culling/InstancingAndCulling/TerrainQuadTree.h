@@ -6,44 +6,23 @@
 #include <memory>
 #include <string>
 
-// Quadtree node representing a terrain tile
-// Level 0 = root (1 tile covering entire terrain) - uses 003 textures
-// Level 1 = 4 children (2x2 tiles) - uses 002 textures  
-// Level 2 = 16 grandchildren (4x4 tiles) - uses 001 textures
-struct QuadTreeNode
-{
-    int Level;              // 0, 1, or 2
-    int NodeX, NodeZ;       // Position in grid at this level (0-0 for L0, 0-1 for L1, 0-3 for L2)
-    
-    // World space bounds
-    float MinX, MinZ;
-    float MaxX, MaxZ;
-    
-    // Texture indices for this node
-    int HeightMapIndex;
-    int DiffuseMapIndex;
-    int NormalMapIndex;
-    
-    // Children (nullptr if leaf or not subdivided)
-    std::unique_ptr<QuadTreeNode> Children[4]; // [0]=SW, [1]=SE, [2]=NW, [3]=NE
-    
-    bool HasChildren() const { return Children[0] != nullptr; }
-};
-
-// Tile to render
+// Tile to render - represents one terrain cell at a specific LOD
 struct TerrainTile
 {
-    int Level;
-    int NodeX, NodeZ;
-    float WorldMinX, WorldMinZ;
-    float WorldSize;
+    int Level;                  // 0=coarsest, 2=finest
+    int NodeX, NodeZ;           // Texture tile coordinates
+    float WorldMinX, WorldMinZ; // World position
+    float WorldSize;            // Size in world units
     int HeightMapIndex;
     int DiffuseMapIndex;
     int NormalMapIndex;
-    DirectX::XMFLOAT4X4 World;
+    DirectX::XMFLOAT4X4 World;  // Transform matrix
+    // UV offset and scale for texture atlas lookup
+    DirectX::XMFLOAT2 UVOffset;
+    DirectX::XMFLOAT2 UVScale;
 };
 
-// GPU instance data
+// GPU instance data (matches shader)
 struct TerrainTileInstance
 {
     DirectX::XMFLOAT4X4 World;
@@ -51,8 +30,19 @@ struct TerrainTileInstance
     int DiffuseMapIndex;
     int NormalMapIndex;
     int LODLevel;
+    // UV offset and scale for texture atlas lookup
+    // Level 2: offset=(0,0), scale=(1,1) - full texture
+    // Level 1: offset=(x/2, z/2), scale=(0.5, 0.5) - quarter of texture
+    // Level 0: offset=(x/4, z/4), scale=(0.25, 0.25) - 1/16 of texture
+    DirectX::XMFLOAT2 UVOffset;
+    DirectX::XMFLOAT2 UVScale;
 };
 
+// Geometry Clipmaps implementation
+// Creates concentric rings of LOD around camera position:
+//   Level 2 (finest): closest to camera, uses 001 folder (4x4 tiles)
+//   Level 1 (medium): middle ring, uses 002 folder (2x2 tiles)
+//   Level 0 (coarsest): outer ring, uses 003 folder (1 tile)
 class TerrainQuadTree
 {
 public:
@@ -61,7 +51,7 @@ public:
 
     void Initialize(float terrainWorldSize, float terrainMaxHeight, float fovY, float screenHeight);
 
-    // Select tiles using screen-space error metric
+    // Select tiles based on distance to camera (clipmap rings)
     void SelectTiles(
         const DirectX::XMFLOAT3& cameraPos,
         const DirectX::BoundingFrustum& worldFrustum,
@@ -77,38 +67,20 @@ public:
     static int GetTextureIndex(int level, int nodeX, int nodeZ);
 
 private:
-    void BuildTree();
-    void BuildNode(QuadTreeNode* node, int level, int nodeX, int nodeZ, 
-                   float minX, float minZ, float maxX, float maxZ);
-    
-    // Recursive tile selection with screen-space error
-    void SelectNode(
-        QuadTreeNode* node,
-        const DirectX::XMFLOAT3& cameraPos,
-        const DirectX::BoundingFrustum& frustum,
-        std::vector<TerrainTile>& outTiles);
-    
-    // Calculate screen-space error for a node
-    // ρ = ε * x / (2 * d * tan(θ/2))
-    // where ε = geometric error, x = screen width, d = distance, θ = FOV
-    float CalculateScreenSpaceError(QuadTreeNode* node, const DirectX::XMFLOAT3& cameraPos);
-    
-    // Check if node is visible in frustum
-    bool IsNodeVisible(QuadTreeNode* node, const DirectX::BoundingFrustum& frustum);
+    // Frustum culling for a cell
+    bool IsBlockVisible(float minX, float minZ, float maxX, float maxZ,
+                        const DirectX::BoundingFrustum& frustum);
 
 private:
-    std::unique_ptr<QuadTreeNode> mRoot;
-    
     float mTerrainSize = 512.0f;
     float mTerrainHeight = 150.0f;
     
-    // For screen-space error calculation
     float mFovY = 0.25f * 3.14159f;
     float mScreenHeight = 720.0f;
-    float mMaxScreenSpaceError = 4.0f; // Max allowed pixel error before subdividing
     
-    // Geometric error per level (approximation of height variation)
-    float mGeometricError[3] = { 50.0f, 25.0f, 12.5f };
+    // Distance thresholds for LOD rings
+    static const int NUM_LEVELS = 3;
+    float mLevelDistance[NUM_LEVELS] = { 1000.0f, 300.0f, 100.0f };
 };
 
 // Texture path helpers
