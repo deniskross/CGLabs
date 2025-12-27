@@ -60,10 +60,15 @@ private:
     ComPtr<ID3D12RootSignature> m_rootSignature;
     ComPtr<ID3D12DescriptorHeap> m_rtvHeap;
     ComPtr<ID3D12DescriptorHeap> m_dsvHeap;
+    ComPtr<ID3D12DescriptorHeap> m_srvHeap;  // Texture SRV heap
     ComPtr<ID3D12PipelineState> m_pipelineState;
     ComPtr<ID3D12Resource> m_constantBuffer;
     UINT m_rtvDescriptorSize;
     UINT m_dsvDescriptorSize;
+    UINT m_srvDescriptorSize;
+
+    // Texture resources
+    ComPtr<ID3D12Resource> m_texture;
 
     ComPtr<ID3D12GraphicsCommandList6> m_commandList;
     SceneConstantBuffer m_constantBufferData;
@@ -82,12 +87,14 @@ private:
 
     void LoadPipeline();
     void LoadAssets();
+    void LoadTexture();
     void PopulateCommandList();
     void MoveToNextFrame();
     void WaitForGpu();
 
 private:
     static const wchar_t* c_meshFilename;
+    static const wchar_t* c_textureFilename;
     static const wchar_t* c_meshShaderFilename;
     static const wchar_t* c_pixelShaderFilename;
 };

@@ -14,7 +14,9 @@
                   SRV(t0), \
                   SRV(t1), \
                   SRV(t2), \
-                  SRV(t3)"
+                  SRV(t3), \
+                  DescriptorTable(SRV(t4)), \
+                  StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_WRAP, addressV=TEXTURE_ADDRESS_WRAP)"
 
 struct Constants
 {
@@ -34,6 +36,7 @@ struct Vertex
 {
     float3 Position;
     float3 Normal;
+    float2 TexCoord;
 };
 
 struct VertexOut
@@ -41,6 +44,7 @@ struct VertexOut
     float4 PositionHS   : SV_Position;
     float3 PositionVS   : POSITION0;
     float3 Normal       : NORMAL0;
+    float2 TexCoord     : TEXCOORD0;
     uint   MeshletIndex : COLOR0;
 };
 
@@ -105,6 +109,7 @@ VertexOut GetVertexAttributes(uint meshletIndex, uint vertexIndex)
     vout.PositionVS = mul(float4(v.Position, 1), Globals.WorldView).xyz;
     vout.PositionHS = mul(float4(v.Position, 1), Globals.WorldViewProj);
     vout.Normal = mul(float4(v.Normal, 0), Globals.World).xyz;
+    vout.TexCoord = float2(v.TexCoord.x, 1.0 - v.TexCoord.y); // Flip V coordinate
     vout.MeshletIndex = meshletIndex;
 
     return vout;
